@@ -412,13 +412,16 @@
 
     <script>
         // ================ AUTH ================
-        const _savedToken = sessionStorage.getItem('crawl4ai_token');
+        // A token remembered on the Whole-site export page (localStorage) is
+        // used here too, so it only has to be entered once per browser.
+        function _remembered() { try { return localStorage.getItem('crawl4ai_token') || ''; } catch { return ''; } }
+        const _savedToken = sessionStorage.getItem('crawl4ai_token') || _remembered();
         const _tokenBar = document.getElementById('token-bar');
         const _tokenInput = document.getElementById('token-input');
         const _tokenSave = document.getElementById('token-save');
         const _tokenStatus = document.getElementById('token-status');
 
-        function getToken() { return sessionStorage.getItem('crawl4ai_token') || ''; }
+        function getToken() { return sessionStorage.getItem('crawl4ai_token') || _remembered(); }
 
         function authFetch(url, opts = {}) {
             const token = getToken();
@@ -439,6 +442,7 @@
 
         function clearToken() {
             sessionStorage.removeItem('crawl4ai_token');
+            try { localStorage.removeItem('crawl4ai_token'); } catch {}
             _tokenInput.value = '';
             _tokenStatus.textContent = 'Token cleared';
             _tokenStatus.className = 'text-xs text-yellow-400';

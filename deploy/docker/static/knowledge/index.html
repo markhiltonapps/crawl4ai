@@ -36,6 +36,10 @@
   }
   input:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
   input[type=number] { max-width: 140px; }
+  .remember { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; margin-top: 8px; }
+  label.check { display: flex; align-items: center; gap: 8px; margin: 0; font-weight: 400; font-size: 14px; color: var(--muted); cursor: pointer; }
+  label.check input { width: 18px; height: 18px; margin: 0; accent-color: var(--accent); }
+  button.link { background: none; border: 0; padding: 4px 0; color: var(--accent); font-size: 14px; font-weight: 400; text-decoration: underline; }
   button {
     font: inherit; font-weight: 600; cursor: pointer; border-radius: 8px;
     padding: 12px 20px; border: 1px solid var(--accent);
@@ -69,6 +73,10 @@
   <form id="form" class="panel">
     <label for="token">API token <span class="hint">(from Railway → Variables → CRAWL4AI_API_TOKEN)</span></label>
     <input id="token" type="password" autocomplete="off" required>
+    <div class="remember">
+      <label class="check"><input id="remember" type="checkbox" checked> Remember on this computer</label>
+      <button id="forget" class="link hidden" type="button">Forget saved token</button>
+    </div>
 
     <label for="url">Website address</label>
     <input id="url" type="text" placeholder="https://www.example.com/" required>
@@ -108,12 +116,31 @@
 <script>
   const $ = (id) => document.getElementById(id);
   const TOKEN_KEY = 'crawl4ai_token', JOB_KEY = 'crawl4ai_site_export_job';
-  const store = {
-    get(k) { try { return sessionStorage.getItem(k) || ''; } catch { return ''; } },
-    set(k, v) { try { sessionStorage.setItem(k, v); } catch {} },
-    del(k) { try { sessionStorage.removeItem(k); } catch {} },
-  };
-  $('token').value = store.get(TOKEN_KEY);
+  const storage = (kind) => ({
+    get(k) { try { return window[kind].getItem(k) || ''; } catch { return ''; } },
+    set(k, v) { try { window[kind].setItem(k, v); } catch {} },
+    del(k) { try { window[kind].removeItem(k); } catch {} },
+  });
+  // sessionStorage lasts for this tab; localStorage survives closing the
+  // browser and is only used when "Remember on this computer" is ticked.
+  const store = storage('sessionStorage'), saved = storage('localStorage');
+  $('token').value = store.get(TOKEN_KEY) || saved.get(TOKEN_KEY);
+  $('forget').classList.toggle('hidden', !saved.get(TOKEN_KEY));
+
+  function rememberToken() {
+    const token = $('token').value.trim();
+    store.set(TOKEN_KEY, token);
+    if ($('remember').checked) saved.set(TOKEN_KEY, token); else saved.del(TOKEN_KEY);
+    $('forget').classList.toggle('hidden', !$('remember').checked);
+  }
+
+  $('forget').addEventListener('click', () => {
+    saved.del(TOKEN_KEY);
+    store.del(TOKEN_KEY);
+    $('token').value = '';
+    $('remember').checked = false;
+    $('forget').classList.add('hidden');
+  });
   let pollTimer = null;
 
   function show(id) {
@@ -138,7 +165,7 @@
   $('form').addEventListener('submit', async (e) => {
     e.preventDefault();
     $('form-error').classList.add('hidden');
-    store.set(TOKEN_KEY, $('token').value.trim());
+    rememberToken();
     $('start').disabled = true;
     try {
       const res = await api('/site-export', {
