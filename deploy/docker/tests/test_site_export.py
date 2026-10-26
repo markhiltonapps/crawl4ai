@@ -104,12 +104,19 @@ class TestCleaning:
         spaced = se.Page(SITE, "# Home\nDecline Accept\nReal text", [])
         assert se.clean_page(spaced, set(), keep_boilerplate=True) == "# Home\nReal text"
 
+    def test_doubled_spaces_collapsed_but_indent_kept(self):
+        page = se.Page(SITE, "# Home\n919 Rd  Main Building   Arlington\n  * item  one\nhard break  \nnext", [])
+        assert se.clean_page(page, set(), keep_boilerplate=True) == (
+            "# Home\n919 Rd Main Building Arlington\n  * item one\nhard break  \nnext")
+
 
 SPACING_FIXTURE = """<html><body>
 <div style="display:flex;justify-content:space-between;width:300px"><span id="d">Sat - Sun</span><span>Closed</span></div>
 <address id="addr"><span>919 West Randol Mill Rd<br></span><span>Main Building<br></span><span>Arlington, TX</span></address>
 <p id="word"><b>Hel</b><i>lo</i> world</p>
 <p id="hidden"><span>A</span><span style="display:none">B</span></p>
+<a id="card" href="/x"><p>Office: <!-- -->(682) 323-5904<br>FAX: <!-- -->(682) 323-4139</p></a>
+<p id="spaced-br">one <br>two</p>
 </body></html>"""
 
 
@@ -142,6 +149,10 @@ class TestSpacingScript:
 
     def test_hidden_elements_untouched(self, page):
         assert page.text_content("#hidden") == "AB"
+
+    def test_space_before_line_break(self, page):
+        assert page.text_content("#card") == "Office: (682) 323-5904 FAX: (682) 323-4139"
+        assert page.text_content("#spaced-br") == "one two"
 
     def test_sitewide_lines_kept_only_on_start_page(self):
         body = "x" * 250

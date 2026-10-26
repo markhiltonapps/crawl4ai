@@ -56,7 +56,9 @@ _JSONLD_BLOCK = re.compile(
 # text reads "Sat - SunClosed". Where two sibling elements are drawn apart on
 # screen - on different lines, or with a gap between them - add the space the
 # layout implies. Elements that touch on the same line (<b>Hel</b><i>lo</i>)
-# are left alone, as are hidden ones.
+# are left alone, as are hidden ones. A <br> also gets a space before it:
+# Markdown conversion drops line breaks inside links and headings, which
+# turned "(682) 323-5904<br>FAX:" into "323-5904FAX:".
 SPACING_JS = """
 (() => {
   const SKIP = new Set(['SCRIPT', 'STYLE', 'NOSCRIPT', 'TEMPLATE', 'BR', 'WBR']);
@@ -68,6 +70,11 @@ SPACING_JS = """
     const sameLine = b.top < a.bottom - 1 && a.top < b.bottom - 1;
     if (sameLine && Math.abs(b.left - a.right) < 1) continue;
     el.after(document.createTextNode(' '));
+  }
+  for (const br of Array.from(document.body.querySelectorAll('br'))) {
+    const prev = br.previousSibling;
+    if (!prev || (prev.nodeType === 3 && /\\s$/.test(prev.data))) continue;
+    br.before(document.createTextNode(' '));
   }
 })();
 """
@@ -186,7 +193,9 @@ def clean_page(page: Page, boilerplate: set, keep_boilerplate: bool) -> str:
             continue
         if not keep_boilerplate and stripped in boilerplate:
             continue
-        out.append(line)
+        # SPACING_JS can leave doubled spaces mid-line; keep indentation and
+        # trailing hard-break spaces.
+        out.append(re.sub(r"(?<=\S) {2,}(?=\S)", " ", line))
         question = re.sub(r"^#+\s*", "", stripped)
         if question in answers and question not in used:
             used.add(question)
