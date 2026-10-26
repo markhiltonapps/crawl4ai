@@ -82,6 +82,12 @@ class MarkdownRequest(BaseModel):
     # vector. The endpoint is derived server-side from the provider name.
 
 
+class SiteExportRequest(BaseModel):
+    """Request body for POST /site-export."""
+    url: str = Field(..., description="Start page; same-site links are followed from here")
+    max_pages: int = Field(100, ge=1, le=1000, description="Upper bound on pages crawled (server-clamped)")
+
+
 class RawCode(BaseModel):
     code: str
 

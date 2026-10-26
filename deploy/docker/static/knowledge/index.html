@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Website to Knowledge File</title>
+<style>
+  :root {
+    --bg: #070708; --panel: #111113; --border: #2a2a2e; --text: #e8e9ed;
+    --muted: #9a9ba3; --accent: #4ee5d5; --accent-ink: #062b28;
+    --ok: #4ade80; --err: #f87171;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 16px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 14px 20px; border-bottom: 1px solid var(--border);
+  }
+  header h1 { font-size: 18px; margin: 0; }
+  header a { color: var(--muted); font-size: 14px; }
+  main { max-width: 720px; margin: 0 auto; padding: 24px 16px 64px; }
+  .panel {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 10px; padding: 20px; margin-bottom: 20px;
+  }
+  .intro { color: var(--muted); margin: 0 0 20px; }
+  label { display: block; font-weight: 600; margin: 16px 0 6px; }
+  label:first-child { margin-top: 0; }
+  .hint { color: var(--muted); font-size: 14px; font-weight: 400; }
+  input {
+    width: 100%; padding: 10px 12px; font-size: 16px; color: var(--text);
+    background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
+  }
+  input:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
+  input[type=number] { max-width: 140px; }
+  button {
+    font: inherit; font-weight: 600; cursor: pointer; border-radius: 8px;
+    padding: 12px 20px; border: 1px solid var(--accent);
+  }
+  button.primary { background: var(--accent); color: var(--accent-ink); }
+  button.secondary { background: transparent; color: var(--accent); }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  .actions { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 20px; }
+  .bar { height: 10px; background: var(--bg); border: 1px solid var(--border); border-radius: 6px; overflow: hidden; margin: 12px 0; }
+  .bar > div { height: 100%; width: 0; background: var(--accent); transition: width .4s; }
+  .muted { color: var(--muted); font-size: 14px; word-break: break-all; }
+  .ok { color: var(--ok); } .err { color: var(--err); }
+  .hidden { display: none; }
+  h2 { font-size: 18px; margin: 0 0 8px; }
+  details { margin-top: 12px; color: var(--muted); font-size: 14px; }
+  details li { word-break: break-all; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Website → Knowledge File</h1>
+  <a href="/playground/">Playground</a>
+</header>
+<main>
+  <p class="intro">
+    Turns a whole website into one clean text file for training an AI agent. It visits
+    every page, keeps the real content, removes menus and repeated banners, and includes
+    FAQ answers hidden behind "+" buttons.
+  </p>
+
+  <form id="form" class="panel">
+    <label for="token">API token <span class="hint">(from Railway → Variables → CRAWL4AI_API_TOKEN)</span></label>
+    <input id="token" type="password" autocomplete="off" required>
+
+    <label for="url">Website address</label>
+    <input id="url" type="text" placeholder="https://www.example.com/" required>
+
+    <label for="max">Maximum pages <span class="hint">(stops after this many)</span></label>
+    <input id="max" type="number" min="1" max="1000" value="100">
+
+    <div class="actions">
+      <button id="start" class="primary" type="submit">Build knowledge file</button>
+    </div>
+    <p id="form-error" class="err hidden"></p>
+  </form>
+
+  <section id="progress" class="panel hidden" aria-live="polite">
+    <h2 id="progress-title">Crawling…</h2>
+    <div class="bar"><div id="bar"></div></div>
+    <p id="progress-text"></p>
+    <p id="progress-url" class="muted"></p>
+  </section>
+
+  <section id="done" class="panel hidden">
+    <h2 class="ok">Your file is ready</h2>
+    <p id="done-text"></p>
+    <div class="actions">
+      <button id="dl-md" class="primary" type="button">Download .md file</button>
+      <button id="dl-zip" class="secondary" type="button">Download one file per page (.zip)</button>
+    </div>
+    <p class="muted">Upload the .md file to your AI agent as its knowledge file. Files stay available here for one hour.</p>
+    <details id="skipped" class="hidden"><summary></summary><ul id="skipped-list"></ul></details>
+  </section>
+
+  <section id="failed" class="panel hidden">
+    <h2 class="err">Something went wrong</h2>
+    <p id="failed-text"></p>
+  </section>
+</main>
+<script>
+  const $ = (id) => document.getElementById(id);
+  const TOKEN_KEY = 'crawl4ai_token', JOB_KEY = 'crawl4ai_site_export_job';
+  const store = {
+    get(k) { try { return sessionStorage.getItem(k) || ''; } catch { return ''; } },
+    set(k, v) { try { sessionStorage.setItem(k, v); } catch {} },
+    del(k) { try { sessionStorage.removeItem(k); } catch {} },
+  };
+  $('token').value = store.get(TOKEN_KEY);
+  let pollTimer = null;
+
+  function show(id) {
+    for (const s of ['progress', 'done', 'failed']) $(s).classList.toggle('hidden', s !== id);
+  }
+
+  async function api(path, opts = {}) {
+    const token = $('token').value.trim();
+    const res = await fetch(path, {
+      ...opts,
+      headers: { ...(opts.headers || {}), Authorization: 'Bearer ' + token },
+    });
+    if (!res.ok) {
+      let msg = res.statusText;
+      try { msg = (await res.json()).detail || msg; } catch {}
+      if (res.status === 401) msg = 'The API token is wrong or missing.';
+      throw new Error(msg);
+    }
+    return res;
+  }
+
+  $('form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    $('form-error').classList.add('hidden');
+    store.set(TOKEN_KEY, $('token').value.trim());
+    $('start').disabled = true;
+    try {
+      const res = await api('/site-export', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url: $('url').value.trim(), max_pages: Number($('max').value) || 100 }),
+      });
+      const job = await res.json();
+      store.set(JOB_KEY, job.job_id);
+      render(job);
+      poll(job.job_id);
+    } catch (err) {
+      $('form-error').textContent = err.message;
+      $('form-error').classList.remove('hidden');
+      $('start').disabled = false;
+    }
+  });
+
+  function poll(id) {
+    clearTimeout(pollTimer);
+    pollTimer = setTimeout(async () => {
+      try {
+        const job = await (await api('/site-export/' + id)).json();
+        render(job);
+        if (job.state === 'running') poll(id);
+      } catch (err) {
+        store.del(JOB_KEY);
+        $('start').disabled = false;
+        $('failed-text').textContent = err.message;
+        show('failed');
+      }
+    }, 2000);
+  }
+
+  function render(job) {
+    if (job.state === 'running') {
+      show('progress');
+      $('start').disabled = true;
+      const total = Math.min(job.pages_found, job.max_pages);
+      $('bar').style.width = Math.round(100 * job.pages_crawled / Math.max(total, 1)) + '%';
+      $('progress-title').textContent = 'Crawling ' + job.start_url;
+      $('progress-text').textContent =
+        job.pages_crawled + ' of ' + total + ' pages found so far. Bigger sites take a few minutes; you can leave this tab open.';
+      $('progress-url').textContent = job.current_url ? 'Now reading: ' + job.current_url : '';
+      return;
+    }
+    $('start').disabled = false;
+    if (job.state === 'failed') {
+      store.del(JOB_KEY);
+      $('failed-text').textContent = job.error || 'The crawl failed.';
+      show('failed');
+      return;
+    }
+    show('done');
+    $('done-text').textContent =
+      job.page_count + ' pages, about ' + job.word_count.toLocaleString() + ' words, from ' + job.start_url +
+      (job.pages_crawled >= job.max_pages ? ' (stopped at your maximum of ' + job.max_pages + ' pages).' : '.');
+    const skipped = [
+      ...job.dropped_urls.map((u) => u + ' (almost no text, e.g. a login or form page)'),
+      ...job.failed_urls.map((u) => u + ' (could not be loaded)'),
+    ];
+    $('skipped').classList.toggle('hidden', !skipped.length);
+    $('skipped').querySelector('summary').textContent = skipped.length + ' page(s) left out';
+    $('skipped-list').replaceChildren(...skipped.map((t) => Object.assign(document.createElement('li'), { textContent: t })));
+    $('dl-md').onclick = () => download(job.job_id, 'md');
+    $('dl-zip').onclick = () => download(job.job_id, 'zip');
+  }
+
+  async function download(id, format) {
+    try {
+      const res = await api('/site-export/' + id + '/download?format=' + format);
+      const name = (/filename="([^"]+)"/.exec(res.headers.get('Content-Disposition') || '') || [])[1] || 'site-content.' + format;
+      const url = URL.createObjectURL(await res.blob());
+      const a = Object.assign(document.createElement('a'), { href: url, download: name });
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 10000);
+    } catch (err) {
+      alert('Download failed: ' + err.message);
+    }
+  }
+
+  // Pick up a running or finished export after a page refresh.
+  const savedJob = store.get(JOB_KEY);
+  if (savedJob && $('token').value) poll(savedJob);
+</script>
+</body>
+</html>

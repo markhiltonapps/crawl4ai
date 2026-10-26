@@ -32,6 +32,7 @@ from api import (
 from schemas import (
     CrawlRequestWithHooks,
     MarkdownRequest,
+    SiteExportRequest,
     RawCode,
     HTMLRequest,
     ScreenshotRequest,
@@ -56,7 +57,7 @@ from fastapi import (
 )
 from rank_bm25 import BM25Okapi
 from fastapi.responses import (
-    StreamingResponse, RedirectResponse, PlainTextResponse, JSONResponse
+    StreamingResponse, RedirectResponse, PlainTextResponse, JSONResponse, Response
 )
 from fastapi.middleware.httpsredirect import HTTPSRedirectMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
@@ -320,6 +321,16 @@ app.mount(
     name="monitor_ui",
 )
 
+# ── static website-to-knowledge-file page ───────────────────
+KNOWLEDGE_DIR = pathlib.Path(__file__).parent / "static" / "knowledge"
+if not KNOWLEDGE_DIR.exists():
+    raise RuntimeError(f"Knowledge-builder assets not found at {KNOWLEDGE_DIR}")
+app.mount(
+    "/knowledge",
+    StaticFiles(directory=KNOWLEDGE_DIR, html=True),
+    name="knowledge_ui",
+)
+
 # ── static assets (logo, etc) ────────────────────────────────
 ASSETS_DIR = pathlib.Path(__file__).parent / "static" / "assets"
 if ASSETS_DIR.exists():
@@ -406,7 +417,7 @@ STRICT_CSP = (
 # The dashboard/playground still ship inline scripts/styles; until they are
 # externalized (CSP-compat refactor) they must not receive the strict CSP or
 # they break. They still get the baseline headers (nosniff, frame DENY).
-_UI_PREFIXES = ("/dashboard", "/playground", "/static")
+_UI_PREFIXES = ("/dashboard", "/playground", "/knowledge", "/static")
 
 
 @app.middleware("http")
@@ -649,6 +660,78 @@ async def get_markdown(
         "markdown": markdown,
         "success": True
     })
+
+
+@app.post("/site-export")
+@limiter.limit(config["rate_limiting"]["default_limit"])
+async def start_site_export(
+    request: Request,
+    body: SiteExportRequest,
+    _td: Dict = Depends(token_dep),
+):
+    """
+    Start crawling a whole website into one clean Markdown knowledge file.
+
+    Follows same-site links from `url` (up to `max_pages`, clamped to
+    limits.site_export_max_pages), keeps the fit Markdown of each page, folds
+    in FAQ answers from JSON-LD, and strips site-wide boilerplate. Poll
+    GET /site-export/{job_id}, then download the .md or .zip.
+    """
+    from crawl4ai.async_configs import _deep_crawl_allowed
+    import site_export
+
+    if not _deep_crawl_allowed():
+        raise HTTPException(
+            403, "Whole-site export is disabled. Set CRAWL4AI_ALLOW_DEEP_CRAWL=true to enable it.")
+    url = body.url.strip()
+    if not url.startswith(("http://", "https://")):
+        url = "https://" + url
+    validate_url_destination(url)
+    if site_export.running_job():
+        raise HTTPException(409, "A site export is already running. Wait for it to finish.")
+    cap = int(config.get("limits", {}).get("site_export_max_pages", 300)) or 1000
+    job = site_export.create_job(url, min(body.max_pages, cap))
+    job.task = asyncio.create_task(site_export.run_export(job))  # keep a reference
+    return JSONResponse(job.status(), status_code=202)
+
+
+@app.get("/site-export/{job_id}")
+async def site_export_status(job_id: str, _td: Dict = Depends(token_dep)):
+    """Progress of a site export: state is running, done or failed."""
+    import site_export
+
+    job = site_export.JOBS.get(job_id)
+    if not job:
+        raise HTTPException(404, "Export not found (finished exports are kept for one hour).")
+    return JSONResponse(job.status())
+
+
+@app.get("/site-export/{job_id}/download")
+async def site_export_download(
+    job_id: str,
+    format: str = "md",
+    _td: Dict = Depends(token_dep),
+):
+    """Download a finished export as one Markdown file (format=md) or a zip of per-page files (format=zip)."""
+    import site_export
+
+    job = site_export.JOBS.get(job_id)
+    if not job:
+        raise HTTPException(404, "Export not found (finished exports are kept for one hour).")
+    if job.state != "done":
+        raise HTTPException(409, f"Export is {job.state}, nothing to download yet.")
+    if format == "zip":
+        content, media = job.zip_bytes, "application/zip"
+    elif format == "md":
+        content, media = job.markdown.encode("utf-8"), "text/markdown; charset=utf-8"
+    else:
+        raise HTTPException(400, "format must be md or zip")
+    name = site_export.export_filename(job.start_url, format)
+    return Response(
+        content,
+        media_type=media,
+        headers={"Content-Disposition": f'attachment; filename="{name}"'},
+    )
 
 
 @app.post("/html")
