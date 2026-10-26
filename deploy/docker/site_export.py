@@ -324,7 +324,22 @@ def create_job(start_url: str, max_pages: int) -> ExportJob:
     return job
 
 
-async def run_export(job: ExportJob, concurrency: int = 4, deadline_sec: float = 2700) -> None:
+# Crawl politely: sites behind bot protection (e.g. Vercel's firewall) answer a
+# burst of requests from one IP with HTTP 429 and then block it for a while.
+PAGE_PAUSE_SEC = 1.0              # after each page, per concurrent slot
+RATE_LIMIT_WAITS = (30.0, 90.0)   # back-off before each retry of a 429'd page
+RATE_LIMITED_MSG = (
+    "{url} is limiting visits from your crawler right now (HTTP 429, too many "
+    "requests). Wait about an hour, then try again."
+)
+
+
+def is_rate_limited(result) -> bool:
+    return (getattr(result, "status_code", None) == 429
+            or "429" in (getattr(result, "error_message", "") or ""))
+
+
+async def run_export(job: ExportJob, concurrency: int = 2, deadline_sec: float = 2700) -> None:
     """Breadth-first crawl of the site, then clean and render. Never raises."""
     from crawl4ai import BrowserConfig, CacheMode, CrawlerRunConfig
     from crawl4ai.content_filter_strategy_lxml import PruningContentFilterLXML
@@ -358,21 +373,30 @@ async def run_export(job: ExportJob, concurrency: int = 4, deadline_sec: float =
         sem = asyncio.Semaphore(concurrency)
 
         first_error = ""
+        rate_limited = False
 
         async def fetch(url: str):
-            nonlocal first_error
+            nonlocal first_error, rate_limited
             async with sem:
                 job.current_url = url
                 try:
                     validate_url_destination(url)
-                    result = await crawler.arun(url=url, config=run_cfg)
+                    for wait in (*RATE_LIMIT_WAITS, None):
+                        result = await crawler.arun(url=url, config=run_cfg)
+                        if result.success or not is_rate_limited(result) or wait is None:
+                            break
+                        logger.info("site export: %s rate-limited, retrying in %ss", url, wait)
+                        await asyncio.sleep(wait)
                     if not result.success:
                         first_error = first_error or (result.error_message or "").strip()
+                        rate_limited = rate_limited or is_rate_limited(result)
                     return url, result
                 except Exception as e:  # one bad page must not sink the export
                     logger.warning("site export: %s failed: %s", url, e)
                     first_error = first_error or str(getattr(e, "detail", None) or e)
                     return url, None
+                finally:
+                    await asyncio.sleep(PAGE_PAUSE_SEC)
 
         while queue and job.pages_crawled < job.max_pages:
             if time.monotonic() > deadline:
@@ -399,6 +423,8 @@ async def run_export(job: ExportJob, concurrency: int = 4, deadline_sec: float =
                         queue.append(nxt)
                 job.pages_found = len(seen)
 
+        if not pages and rate_limited:
+            raise RuntimeError(RATE_LIMITED_MSG.format(url=job.start_url))
         if not pages:
             reason = first_error.splitlines()[0][:300] if first_error else "no response"
             raise RuntimeError(f"Could not load {job.start_url}: {reason}")

@@ -9,6 +9,7 @@ opt-in, SSRF validation and downloads of a finished job.
 import json
 import zipfile
 import io
+from types import SimpleNamespace
 
 import pytest
 
@@ -257,3 +258,93 @@ class TestRoutes:
     def test_page_is_served_without_token(self, client):
         r = client.get("/knowledge/")
         assert r.status_code == 200 and "Download .md file" in r.text
+
+
+# ──────────────────────────── crawl loop ────────────────────────────
+
+
+class FakeCrawler:
+    """Serves a tiny site; `limited` maps URL -> how many 429s to answer first."""
+
+    def __init__(self, site, limited=None):
+        self.site, self.limited, self.calls = site, dict(limited or {}), []
+
+    async def arun(self, url, config):
+        self.calls.append(url)
+        if self.limited.get(url, 0) > 0:
+            self.limited[url] -= 1
+            return SimpleNamespace(success=False, status_code=429, html="", links={},
+                                   markdown=None, redirected_url=url,
+                                   error_message="Blocked by anti-bot protection: HTTP 429 Too Many Requests")
+        body, links = self.site[url]
+        return SimpleNamespace(success=True, status_code=200, error_message="", redirected_url=url,
+                               html="", markdown=SimpleNamespace(fit_markdown=body),
+                               links={"internal": [{"href": h} for h in links]})
+
+
+@pytest.fixture
+def fake_env(monkeypatch):
+    import asyncio
+    import crawler_pool
+    import egress_broker
+    import utils
+
+    holder = {}
+
+    async def get_crawler(cfg):
+        return holder["crawler"]
+
+    async def release_crawler(c):
+        pass
+
+    monkeypatch.setattr(crawler_pool, "get_crawler", get_crawler)
+    monkeypatch.setattr(crawler_pool, "release_crawler", release_crawler)
+    monkeypatch.setattr(egress_broker, "enforce_egress", lambda cfg: None)
+    monkeypatch.setattr(utils, "validate_url_destination", lambda url: None)
+    monkeypatch.setattr(se, "PAGE_PAUSE_SEC", 0)
+    monkeypatch.setattr(se, "RATE_LIMIT_WAITS", (0, 0))
+    se.JOBS.clear()
+
+    def run(crawler, max_pages=50):
+        holder["crawler"] = crawler
+        job = se.create_job(SITE, max_pages)
+        asyncio.run(se.run_export(job))
+        return job
+
+    yield run
+    se.JOBS.clear()
+
+
+TEXT = "Some real page content. " * 12
+TINY_SITE = {
+    SITE: (f"# Home\n{TEXT}", ["/a/", "/b/", "https://other.com/x/"]),
+    SITE + "a/": (f"# A\n{TEXT}", ["/", "/b"]),
+    SITE + "b/": (f"# B\n{TEXT}", []),
+}
+
+
+class TestCrawlLoop:
+    def test_follows_same_site_links_once_each(self, fake_env):
+        crawler = FakeCrawler(TINY_SITE)
+        job = fake_env(crawler)
+        assert job.state == "done", job.error
+        assert sorted(crawler.calls) == sorted(TINY_SITE)
+        assert job.page_count == 3 and "## PAGE: B" in job.markdown
+
+    def test_rate_limited_page_is_retried(self, fake_env):
+        crawler = FakeCrawler(TINY_SITE, limited={SITE + "a/": 1})
+        job = fake_env(crawler)
+        assert job.state == "done" and job.failed_urls == []
+        assert crawler.calls.count(SITE + "a/") == 2
+
+    def test_blocked_site_fails_with_advice(self, fake_env):
+        crawler = FakeCrawler(TINY_SITE, limited={SITE: 99})
+        job = fake_env(crawler)
+        assert job.state == "failed"
+        assert "Wait about an hour" in job.error
+        assert crawler.calls == [SITE] * (len(se.RATE_LIMIT_WAITS) + 1)
+
+    def test_stops_at_max_pages(self, fake_env):
+        crawler = FakeCrawler(TINY_SITE)
+        job = fake_env(crawler, max_pages=2)
+        assert job.state == "done" and job.pages_crawled == 2 and len(crawler.calls) == 2
