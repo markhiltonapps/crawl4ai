@@ -29,7 +29,7 @@ import time
 import zipfile
 from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Optional, Tuple
-from urllib.parse import urldefrag, urljoin, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, unquote, urldefrag, urlencode, urljoin, urlsplit, urlunsplit
 from uuid import uuid4
 
 logger = logging.getLogger(__name__)
@@ -43,7 +43,7 @@ _SKIP_EXTENSIONS = (
 )
 # Lines that are page chrome rather than content.
 _NOISE_LINE = re.compile(
-    r"^(\[Skip to (main )?content\]|We use cookies|Decline ?Accept$|Accept( all)?$|"
+    r"^(\[?Skip to (main )?content\]?|We use cookies|Decline ?Accept$|Accept( all)?$|"
     r"0\+|[+×]$)",
     re.IGNORECASE,
 )
@@ -53,22 +53,26 @@ _JSONLD_BLOCK = re.compile(
 # Runs in the page before capture. Sites often lay out label/value pairs as
 # adjacent elements with no whitespace between them in the markup
 # (<span>Sat - Sun</span><span>Closed</span> in a flex row), so the extracted
-# text reads "Sat - SunClosed". Where two sibling elements are drawn apart on
-# screen - on different lines, or with a gap between them - add the space the
-# layout implies. Elements that touch on the same line (<b>Hel</b><i>lo</i>)
-# are left alone, as are hidden ones. A <br> also gets a space before it:
+# text reads "Sat - SunClosed". Add a space between two sibling elements unless
+# both are inline text runs that touch on the same line (<b>Hel</b><i>lo</i>).
+# Elements in collapsed sections have no layout to measure, so there the
+# computed display decides: separate boxes (flex items, blocks, inline-blocks)
+# get a space, inline runs do not. A <br> also gets a space before it:
 # Markdown conversion drops line breaks inside links and headings, which
 # turned "(682) 323-5904<br>FAX:" into "323-5904FAX:".
 SPACING_JS = """
 (() => {
   const SKIP = new Set(['SCRIPT', 'STYLE', 'NOSCRIPT', 'TEMPLATE', 'BR', 'WBR']);
+  const inline = (el) => ['inline', 'contents'].includes(getComputedStyle(el).display);
   for (const el of Array.from(document.body.querySelectorAll('*'))) {
     const next = el.nextSibling;
     if (!next || next.nodeType !== 1 || SKIP.has(el.tagName) || SKIP.has(next.tagName)) continue;
-    const a = el.getBoundingClientRect(), b = next.getBoundingClientRect();
-    if (!(a.width || a.height) || !(b.width || b.height)) continue;
-    const sameLine = b.top < a.bottom - 1 && a.top < b.bottom - 1;
-    if (sameLine && Math.abs(b.left - a.right) < 1) continue;
+    if (inline(el) && inline(next)) {
+      const a = el.getBoundingClientRect(), b = next.getBoundingClientRect();
+      if (!(a.width || a.height) || !(b.width || b.height)) continue;
+      const sameLine = b.top < a.bottom - 1 && a.top < b.bottom - 1;
+      if (sameLine && Math.abs(b.left - a.right) < 1) continue;
+    }
     el.after(document.createTextNode(' '));
   }
   for (const br of Array.from(document.body.querySelectorAll('br'))) {
@@ -95,8 +99,33 @@ def site_host(url: str) -> str:
     return host[4:] if host.startswith("www.") else host
 
 
+# Query parameters that only track the visitor; they never change the page.
+_TRACKING_PARAM = re.compile(
+    r"^(utm_\w+|gclid|gbraid|wbraid|fbclid|msclkid|yclid|dclid|igshid|srsltid|"
+    r"mc_cid|mc_eid|_ga|_gl|_hs\w*|hsa_\w+|ref|ref_src)$",
+    re.IGNORECASE,
+)
+
+
+def clean_query(query: str) -> str:
+    """Query string without tracking parameters, in a stable order."""
+    pairs = [p for p in parse_qsl(query, keep_blank_values=True)
+             if not _TRACKING_PARAM.match(p[0])]
+    return urlencode(sorted(pairs))
+
+
+def same_site(host: str, url_host: str) -> bool:
+    """url_host is the site or one of its subdomains (shop.x.com for x.com)."""
+    url_host = url_host[4:] if url_host.startswith("www.") else url_host
+    return url_host == host or url_host.endswith("." + host)
+
+
 def normalize_url(href: str, base: str, host: str) -> Optional[str]:
-    """Absolute, fragment- and query-free URL for a same-site page, else None."""
+    """Absolute, fragment-free URL for a same-site page, else None.
+
+    The query string is kept (minus tracking parameters): some sites address
+    real pages that way (?page_id=12, item?id=34).
+    """
     if not href:
         return None
     href = href.strip()
@@ -111,13 +140,47 @@ def normalize_url(href: str, base: str, host: str) -> Optional[str]:
     path = parts.path or "/"
     if path.lower().endswith(_SKIP_EXTENSIONS):
         return None
-    return urlunsplit((parts.scheme, parts.netloc.lower(), path, "", ""))
+    return urlunsplit((parts.scheme, parts.netloc.lower(), path, clean_query(parts.query), ""))
 
 
 def page_key(url: str) -> str:
     """Identity of a page: /about and /about/ (and www/no-www) are the same page."""
     parts = urlsplit(url)
-    return site_host(url) + (parts.path.rstrip("/") or "/")
+    query = clean_query(parts.query)
+    return site_host(url) + (parts.path.rstrip("/") or "/") + (f"?{query}" if query else "")
+
+
+_IMAGE = re.compile(r"!\[[^\]]*\]\([^)]*\)")
+_LINK = re.compile(r"\[([^\[\]]*)\]\(([^)\s]*)(?:\s+\"[^\"]*\")?\)")
+
+
+def simplify_links(markdown: str, page_url: str) -> str:
+    """Make link-heavy Markdown read as text for an AI.
+
+    Link addresses were 10-60% of an export. Images go; links to the site's
+    own pages (whose text is elsewhere in the file) keep only their words;
+    phone and email links keep the number/address when the words omit it;
+    links to other sites stay, without tracking parameters.
+    """
+    host = site_host(page_url)
+    markdown = _IMAGE.sub("", markdown)
+
+    def repl(m):
+        text, href = m.group(1).strip(), m.group(2)
+        low = href.lower()
+        if low.startswith(("tel:", "mailto:")):
+            value = unquote(href.split(":", 1)[1].split("?")[0])
+            digits = re.sub(r"\D", "", value)
+            shown = (low.startswith("tel:") and digits and digits[-7:] in re.sub(r"\D", "", text)) \
+                or value.lower() in text.lower()
+            return text if shown or not value else (f"{text} ({value})" if text else value)
+        url = urljoin(page_url, href)
+        parts = urlsplit(url)
+        if not text or parts.scheme not in ("http", "https") or same_site(host, (parts.hostname or "").lower()):
+            return text
+        return f"[{text}]({urlunsplit(parts._replace(query=clean_query(parts.query), fragment=''))})"
+
+    return _LINK.sub(repl, markdown)
 
 
 # ─────────────────────────── content helpers ───────────────────────────
@@ -212,6 +275,7 @@ def clean_page(page: Page, boilerplate: set, keep_boilerplate: bool) -> str:
 
 def build_documents(pages: List[Page], start_url: str) -> Tuple[List[Page], List[str]]:
     """Clean every page. Returns (kept pages, URLs dropped for having no content)."""
+    pages = [Page(p.url, simplify_links(p.markdown, p.url), p.faqs, p.title) for p in pages]
     boilerplate = repeated_lines(pages)
     start = page_key(start_url)
     kept, dropped = [], []

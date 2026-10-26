@@ -27,8 +27,14 @@ class TestUrls:
     def test_relative_link_resolves(self):
         assert se.normalize_url("/about/", SITE + "x/", self.host) == "https://www.example.com/about/"
 
-    def test_fragment_and_query_dropped(self):
-        assert se.normalize_url("/faq/?ref=nav#top", SITE, self.host) == "https://www.example.com/faq/"
+    def test_fragment_and_tracking_params_dropped(self):
+        assert se.normalize_url("/faq/?ref=nav&utm_source=x#top", SITE, self.host) == "https://www.example.com/faq/"
+
+    def test_content_query_kept_in_stable_order(self):
+        assert se.normalize_url("/index.php?page_id=12&utm_medium=e&lang=en", SITE, self.host) == \
+            "https://www.example.com/index.php?lang=en&page_id=12"
+        assert se.page_key("https://example.com/item?id=1") != se.page_key("https://example.com/item?id=2")
+        assert se.page_key("https://example.com/a/?b=2&a=1&fbclid=z") == se.page_key("https://www.example.com/a?a=1&b=2")
 
     def test_www_and_bare_host_are_same_site(self):
         assert se.normalize_url("https://example.com/blog/", SITE, self.host) == "https://example.com/blog/"
@@ -77,10 +83,42 @@ class TestFaqs:
 # ───────────────────────────── cleaning ─────────────────────────────
 
 BANNER = "Now accepting new patients. [Book](https://www.example.com/book/)"
+BANNER_TEXT = "Now accepting new patients. Book"  # after simplify_links
 
 
 def _page(path, body, faqs=()):
     return se.Page(SITE + path, f"{BANNER}\n[Skip to content](#main)\n{body}", list(faqs))
+
+
+class TestLinks:
+    def test_own_site_links_keep_only_words(self):
+        md = "See [our services](/services/) and [Frisco](https://example.com/locations/frisco/?utm_source=x)."
+        assert se.simplify_links(md, SITE) == "See our services and Frisco."
+
+    def test_subdomain_counts_as_own_site(self):
+        md = "[Sign in](https://users.example.com/signin?referralInfo=abc&loginCompName=x)"
+        assert se.simplify_links(md, SITE) == "Sign in"
+
+    def test_external_links_kept_without_tracking(self):
+        md = '[Read on Medium](https://medium.com/post-1?utm_source=site&id=5 "title")'
+        assert se.simplify_links(md, SITE) == "[Read on Medium](https://medium.com/post-1?id=5)"
+
+    def test_images_and_empty_links_dropped(self):
+        md = "[![logo](https://example.com/logo.png)](https://example.com/)Welcome ![hero](/h.jpg)"
+        assert se.simplify_links(md, SITE) == "Welcome "
+
+    def test_phone_and_email_stay_readable(self):
+        assert se.simplify_links("[(682) 323-5904](tel:6823235904)", SITE) == "(682) 323-5904"
+        assert se.simplify_links("[Call us](tel:+18885734517)", SITE) == "Call us (+18885734517)"
+        assert se.simplify_links("[Email us](mailto:info@example.com?subject=Hi)", SITE) == "Email us (info@example.com)"
+        assert se.simplify_links("[info@example.com](mailto:info@example.com)", SITE) == "info@example.com"
+
+    def test_per_page_skip_links_become_boilerplate(self):
+        body = "x" * 250
+        pages = [se.Page(SITE + p, f"[Skip to content](https://www.example.com/{p}#main)\n# {p or 'Home'}\n{body}{p}", [])
+                 for p in ("", "a/", "b/", "c/")]
+        kept, _ = se.build_documents(pages, SITE)
+        assert not any("Skip to content" in p.markdown for p in kept)
 
 
 class TestCleaning:
@@ -110,12 +148,37 @@ class TestCleaning:
         assert se.clean_page(page, set(), keep_boilerplate=True) == (
             "# Home\n919 Rd Main Building Arlington\n  * item one\nhard break  \nnext")
 
+    def test_sitewide_lines_kept_only_on_start_page(self):
+        body = "x" * 250
+        pages = [_page("", f"# Home\n{body}")] + [_page(f"p{i}/", f"# Page {i}\n{body}{i}") for i in range(4)]
+        kept, dropped = se.build_documents(pages, SITE)
+        assert dropped == []
+        assert kept[0].url == SITE and BANNER_TEXT in kept[0].markdown
+        assert all(BANNER_TEXT not in p.markdown and "Skip to content" not in p.markdown for p in kept[1:])
+        assert [p.title for p in kept[1:]] == ["Page 0", "Page 1", "Page 2", "Page 3"]
+
+    def test_small_sites_keep_everything(self):
+        pages = [_page("", "# Home\n" + "a" * 250), _page("b/", "# B\n" + "b" * 250)]
+        kept, _ = se.build_documents(pages, SITE)
+        assert all(BANNER_TEXT in p.markdown for p in kept)
+
+    def test_near_empty_pages_dropped_but_start_page_kept(self):
+        pages = [_page("", "# Home"), _page("login/", "# Log in"), _page("about/", "# About\n" + "a" * 300)]
+        kept, dropped = se.build_documents(pages, SITE)
+        assert [p.url for p in kept] == [SITE, SITE + "about/"]
+        assert dropped == [SITE + "login/"]
+
+
+
 
 SPACING_FIXTURE = """<html><body>
 <div style="display:flex;justify-content:space-between;width:300px"><span id="d">Sat - Sun</span><span>Closed</span></div>
 <address id="addr"><span>919 West Randol Mill Rd<br></span><span>Main Building<br></span><span>Arlington, TX</span></address>
 <p id="word"><b>Hel</b><i>lo</i> world</p>
 <p id="hidden"><span>A</span><span style="display:none">B</span></p>
+<div style="display:none"><div id="chips" style="display:flex;gap:8px"><span>Traveling</span><span>Walking</span></div>
+  <p id="collapsed-inline"><b>Hel</b><i>lo</i></p></div>
+<div id="pills" style="display:flex"><span style="padding:4px">Upper</span><span style="padding:4px">Tree Knit</span></div>
 <a id="card" href="/x"><p>Office: <!-- -->(682) 323-5904<br>FAX: <!-- -->(682) 323-4139</p></a>
 <p id="spaced-br">one <br>two</p>
 </body></html>"""
@@ -148,32 +211,21 @@ class TestSpacingScript:
     def test_touching_inline_elements_untouched(self, page):
         assert page.text_content("#word") == "Hello world"
 
-    def test_hidden_elements_untouched(self, page):
-        assert page.text_content("#hidden") == "AB"
+    def test_hidden_neighbour_still_separated(self, page):
+        assert page.text_content("#hidden") == "A B"
+
+    def test_collapsed_section_boxes_separated(self, page):
+        assert page.text_content("#chips") == "Traveling Walking"
+
+    def test_collapsed_section_inline_runs_untouched(self, page):
+        assert page.text_content("#collapsed-inline") == "Hello"
+
+    def test_touching_padded_boxes_separated(self, page):
+        assert page.text_content("#pills") == "Upper Tree Knit"
 
     def test_space_before_line_break(self, page):
         assert page.text_content("#card") == "Office: (682) 323-5904 FAX: (682) 323-4139"
         assert page.text_content("#spaced-br") == "one two"
-
-    def test_sitewide_lines_kept_only_on_start_page(self):
-        body = "x" * 250
-        pages = [_page("", f"# Home\n{body}")] + [_page(f"p{i}/", f"# Page {i}\n{body}{i}") for i in range(4)]
-        kept, dropped = se.build_documents(pages, SITE)
-        assert dropped == []
-        assert kept[0].url == SITE and BANNER in kept[0].markdown
-        assert all(BANNER not in p.markdown and "Skip to content" not in p.markdown for p in kept[1:])
-        assert [p.title for p in kept[1:]] == ["Page 0", "Page 1", "Page 2", "Page 3"]
-
-    def test_small_sites_keep_everything(self):
-        pages = [_page("", "# Home\n" + "a" * 250), _page("b/", "# B\n" + "b" * 250)]
-        kept, _ = se.build_documents(pages, SITE)
-        assert all(BANNER in p.markdown for p in kept)
-
-    def test_near_empty_pages_dropped_but_start_page_kept(self):
-        pages = [_page("", "# Home"), _page("login/", "# Log in"), _page("about/", "# About\n" + "a" * 300)]
-        kept, dropped = se.build_documents(pages, SITE)
-        assert [p.url for p in kept] == [SITE, SITE + "about/"]
-        assert dropped == [SITE + "login/"]
 
 
 class TestRendering:
