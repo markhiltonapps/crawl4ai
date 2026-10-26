@@ -43,13 +43,34 @@ _SKIP_EXTENSIONS = (
 )
 # Lines that are page chrome rather than content.
 _NOISE_LINE = re.compile(
-    r"^(\[Skip to (main )?content\]|We use cookies|DeclineAccept$|Accept( all)?$|"
+    r"^(\[Skip to (main )?content\]|We use cookies|Decline ?Accept$|Accept( all)?$|"
     r"0\+|[+×]$)",
     re.IGNORECASE,
 )
 _JSONLD_BLOCK = re.compile(
     r"<script[^>]*application/ld\+json[^>]*>(.*?)</script>", re.S | re.I
 )
+# Runs in the page before capture. Sites often lay out label/value pairs as
+# adjacent elements with no whitespace between them in the markup
+# (<span>Sat - Sun</span><span>Closed</span> in a flex row), so the extracted
+# text reads "Sat - SunClosed". Where two sibling elements are drawn apart on
+# screen - on different lines, or with a gap between them - add the space the
+# layout implies. Elements that touch on the same line (<b>Hel</b><i>lo</i>)
+# are left alone, as are hidden ones.
+SPACING_JS = """
+(() => {
+  const SKIP = new Set(['SCRIPT', 'STYLE', 'NOSCRIPT', 'TEMPLATE', 'BR', 'WBR']);
+  for (const el of Array.from(document.body.querySelectorAll('*'))) {
+    const next = el.nextSibling;
+    if (!next || next.nodeType !== 1 || SKIP.has(el.tagName) || SKIP.has(next.tagName)) continue;
+    const a = el.getBoundingClientRect(), b = next.getBoundingClientRect();
+    if (!(a.width || a.height) || !(b.width || b.height)) continue;
+    const sameLine = b.top < a.bottom - 1 && a.top < b.bottom - 1;
+    if (sameLine && Math.abs(b.left - a.right) < 1) continue;
+    el.after(document.createTextNode(' '));
+  }
+})();
+"""
 # A line on at least this share of pages is treated as site-wide boilerplate.
 REPEAT_SHARE = 0.25
 # Below this many pages there is no meaningful "site-wide" signal.
@@ -317,6 +338,7 @@ async def run_export(job: ExportJob, concurrency: int = 4, deadline_sec: float =
             markdown_generator=DefaultMarkdownGenerator(content_filter=PruningContentFilterLXML()),
             scraping_strategy=LXMLWebScrapingStrategy(),
             cache_mode=CacheMode.BYPASS,
+            js_code=SPACING_JS,
         )
 
         host = site_host(job.start_url)

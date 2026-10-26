@@ -101,6 +101,47 @@ class TestCleaning:
     def test_counters_and_cookie_banner_dropped(self):
         page = se.Page(SITE, "# Home\n0+Texas Locations\nWe use cookies. [Privacy](x)\nDeclineAccept\nReal text", [])
         assert se.clean_page(page, set(), keep_boilerplate=True) == "# Home\nReal text"
+        spaced = se.Page(SITE, "# Home\nDecline Accept\nReal text", [])
+        assert se.clean_page(spaced, set(), keep_boilerplate=True) == "# Home\nReal text"
+
+
+SPACING_FIXTURE = """<html><body>
+<div style="display:flex;justify-content:space-between;width:300px"><span id="d">Sat - Sun</span><span>Closed</span></div>
+<address id="addr"><span>919 West Randol Mill Rd<br></span><span>Main Building<br></span><span>Arlington, TX</span></address>
+<p id="word"><b>Hel</b><i>lo</i> world</p>
+<p id="hidden"><span>A</span><span style="display:none">B</span></p>
+</body></html>"""
+
+
+class TestSpacingScript:
+    """SPACING_JS in a real browser; skipped where none is installed."""
+
+    @pytest.fixture(scope="class")
+    def page(self):
+        sync_api = pytest.importorskip("playwright.sync_api")
+        try:
+            pw = sync_api.sync_playwright().start()
+            browser = pw.chromium.launch()
+        except Exception as e:
+            pytest.skip(f"no browser available: {e}")
+        page = browser.new_page()
+        page.set_content(SPACING_FIXTURE)
+        page.evaluate(se.SPACING_JS)
+        yield page
+        browser.close()
+        pw.stop()
+
+    def test_spaced_flex_pair(self, page):
+        assert page.text_content("div").strip() == "Sat - Sun Closed"
+
+    def test_stacked_spans(self, page):
+        assert " ".join(page.text_content("#addr").split()) == "919 West Randol Mill Rd Main Building Arlington, TX"
+
+    def test_touching_inline_elements_untouched(self, page):
+        assert page.text_content("#word") == "Hello world"
+
+    def test_hidden_elements_untouched(self, page):
+        assert page.text_content("#hidden") == "AB"
 
     def test_sitewide_lines_kept_only_on_start_page(self):
         body = "x" * 250
